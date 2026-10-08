@@ -25,6 +25,7 @@ if '.' not in __package__:
   from common import duckdb_logica
   from common import sqlite3_logica
   from common import psql_logica
+  from common import clickhouse_logica
   from compiler import functors
   from compiler import rule_translate
   from compiler import universe
@@ -34,6 +35,7 @@ else:
   from ..common import duckdb_logica
   from ..common import sqlite3_logica
   from ..common import psql_logica
+  from ..common import clickhouse_logica
   from ..compiler import functors
   from ..compiler import rule_translate
   from ..compiler import universe
@@ -116,12 +118,16 @@ def RunQuery(sql,
                           ['--output-format=ALIGNED'],
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE)
   elif engine == 'duckdb':
-    import duckdb
-    connection = duckdb.connect()
+    connection = duckdb_logica.GetConnection()
     if 'clingo' in settings and settings['clingo'] != False:
       duckdb_logica.ConnectClingo(connection, logical_context=logical_context)
     df = connection.sql(sql).df()
     return sqlite3_logica.DataframeAsArtisticTable(df)
+  elif engine == 'clickhouse':
+    return clickhouse_logica.RunQuery(
+        sql,
+        output_format=output_format,
+        engine_settings=settings)
   else:
     assert False, 'Unknown engine: %s' % engine
   o, _ = p.communicate(sql.encode())
@@ -152,8 +158,7 @@ def RunQueryPandas(sql, engine, connection=None):
   if connection is None and engine == 'sqlite':
     connection = sqlite3_logica.SqliteConnect()
   if connection is None and engine == 'duckdb':
-    import duckdb
-    connection = duckdb.connect()
+    connection = duckdb_logica.GetConnection()
   if connection is None:
     assert False, 'Connection is required for engines other than SQLite.'
   if engine == 'bigquery':

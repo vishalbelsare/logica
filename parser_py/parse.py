@@ -20,6 +20,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import ast
+import codecs
 import copy
 import os
 import re
@@ -29,8 +31,10 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 if '.' not in __package__:
   from common import color
+  from parser_cpp import logica_parse_cpp
 else:
   from ..common import color
+  from ..parser_cpp import logica_parse_cpp
 
 CLOSE_TO_OPEN = {
     ')': '(',
@@ -184,6 +188,14 @@ def Traverse(s):
         yield (idx, None, 'EOL in string')
       if c == '"':
         state = state[:-1]
+    elif State() == "'":
+      track_parenthesis = False
+      if c == "'":
+        state = state[:-1]
+      if c == '\\':
+        state += '\\'
+    elif State() == '\\':
+      state = state[:-1] # character is screened whatever that is.
     elif State() == '`':
       track_parenthesis = False
       if c == '`':
@@ -217,6 +229,8 @@ def Traverse(s):
         idx += 1
       elif c == '"':
         state += '"'
+      elif c == "'":
+        state += "'"
       elif c == '`':
         state += '`'
       elif c2 == '/*':
@@ -310,6 +324,7 @@ def SplitRaw(s, separator):
   l = len(separator)
   traverse = Traverse(s)
   part_start = 0
+  separator_alphanum = separator.isalnum()
   for idx, state, status in traverse:
     # TODO: This should be thrown by Traverse.
     if status != 'OK':
@@ -319,6 +334,12 @@ def SplitRaw(s, separator):
     if not state and s[idx:(idx + l)] == separator and (
         len(s) == idx + l or s[idx + l] != '|') and (
             idx == 0 or s[idx - 1] != '|'):
+      # Bail out if this is alphanum separator that's part of
+      # a word.
+      if separator_alphanum:
+        if (idx > 0 and s[idx - 1].isalnum() or
+            idx + l < len(s) and s[idx + l].isalnum()):
+          continue
       # TODO: Treat tuples properly.
       parts.append(s[part_start:idx])
       for _ in range(l - 1):
@@ -530,6 +551,21 @@ def ParseString(s):
       s[-1] == '"' and
       '"' not in s[1:-1]):
     return {'the_string': s[1:-1]}
+  if (len(s) >= 2 and
+      s[0] == "'" and
+      s[-1] == "'"):
+    meat = s[1:-1]
+    screen = False
+    for c in meat:
+      if screen:
+        screen = False
+        continue
+      if not screen and c == "'":
+        break
+      if c == '\\':
+        screen = True
+    else:  # for ... else ... LOL %D
+      return {'the_string': ast.literal_eval(s)}
   if (len(s) >= 6 and
       s[:3] == '"""' and
       s[-3:] == '"""' and
@@ -795,6 +831,9 @@ def ActuallyParseExpression(s):
   v = ParseRecord(s)
   if v:
     return {'record': v}
+  v = ParsePropositionalImplication(s)
+  if v:
+    return {'call': v['predicate']}
   v = ParseCall(s, is_aggregation_allowed=False)
   if v:
     return {'call': v}
@@ -849,6 +888,15 @@ def ParseGenericCall(s, opening, closing):
             s[:idx] == '++?' or
             idx >= 2 and s[0] == '`' and s[idx - 1] == '`'):
           predicate = s[:idx]
+          if (predicate.startswith('-') and
+              any(c in string.ascii_letters + string.digits + '_'
+                  for c in predicate)):
+            # A minus may occur inside a name, but an ALPHANUMERIC
+            # name never starts with one: -A() is the unary minus of
+            # A(), not a call of predicate '-A'. A purely symbolic
+            # operator name like -+-(left:, right:) legitimately does
+            # start with a minus. ('->' is specialcased above.)
+            return None
           break
         else:
           return None
@@ -945,8 +993,7 @@ def ParseProposition(s):
       return {'conjunction': {'conjunct': [c]}}
   c = ParsePropositionalImplication(s)
   if c:
-    return {'conjunction': {'conjunct': [c]}}
-
+    return c
   c = ParseImplication(s)
   if c:
     raise ParsingException('If-then-else clause is only supported as an '
@@ -1121,7 +1168,7 @@ def ParseSubscript(s: HeritageAwareString):
     return {'record': record, 'subscript': subscript}
 
 
-def ParseHeadCall(s):
+def ParseHeadCall(s, distinct_from_outside=False):
   """Parsing rule head, excluding 'distinct'."""
   saw_open = False
   idx = -1
@@ -1141,10 +1188,19 @@ def ParseHeadCall(s):
   if not call:
     raise ParsingException('Could not parse predicate call.', call_str)
   operator_expression = Split(post_call_str, '=')
+  def CheckAggregationCoherence(call):
+    if not distinct_from_outside:
+      for fv in call['record']['field_value']:
+        if 'aggregation' in fv['value']:
+          raise ParsingException(
+            'Aggregation appears in a non-distinct predicate. '
+            'Did you forget >>distinct<<?', call_str)
+
   if len(operator_expression) == 1:
     if operator_expression[0]:
       raise ParsingException('Unexpected text in the head of a rule.',
                              operator_expression[0])
+    CheckAggregationCoherence(call)
     return (call, False)
   # We have a value!
   if len(operator_expression) > 2:
@@ -1159,6 +1215,7 @@ def ParseHeadCall(s):
         'field': 'logica_value',
         'value': {'expression': ParseExpression(expression_str)}
     })
+    CheckAggregationCoherence(call)
     return (call, False)
 
   aggregated_field_value = {
@@ -1232,13 +1289,32 @@ def ParseFunctionRule(s: HeritageAwareString) -> Optional[List[Dict]]:
   return [annotation, rule]
 
 
-def GrabDenotation(head, denotation):
+def GrabDenotation(head, denotation, with_arguments=False):
   head_couldbe = Split(head, denotation)
   if len(head_couldbe) > 2:
-    raise ParsingException('Too many >>%s\'s<<.' % denotation, head)
+    raise ParsingException(
+        'Too many >>%s\'s<<, or on it is on incorrect place.'
+        'Denotations go as [distrinct] [order_by(...)] '
+        '[limit(...)].' % denotation, head)
+  if with_arguments:
+    if len(head_couldbe) == 2:
+      head_couldbe[1] = Strip(head_couldbe[1])
+      if head_couldbe[1] and head_couldbe[1][0] == '(':
+        raise ParsingException(
+          'Can not parse denotations when extracting >>%s<<. '
+          'Denotations should go as [distinct][order_by][limit].' % denotation,
+          head)
+      args = ParseRecordInternals(head_couldbe[1])
+      return head_couldbe[0], True, args
+    else:
+      return head, False, None
+
   if len(head_couldbe) == 2 and head_couldbe[1].strip():
-    raise ParsingException('Denotation >>%s<< should go last.' % denotation,
-                           head)
+    raise ParsingException(
+        'Too many >>%s\'s<<, or on incorrect place.'
+        'Denotations go as [distrinct] [order_by(...)] '
+        '[limit(...)].' % denotation, head)
+
   head = head_couldbe[0]
   return head, len(head_couldbe) == 2
 
@@ -1253,11 +1329,16 @@ def ParseRule(s: HeritageAwareString) -> Dict:
   head, couldbe = GrabDenotation(head, 'couldbe')
   head, cantbe = GrabDenotation(head, 'cantbe')
   head, shouldbe = GrabDenotation(head, 'shouldbe')
+  head, limit, limit_what = GrabDenotation(head, 'limit',
+                                           with_arguments=True)
+  head, order_by, order_by_what = GrabDenotation(head, 'order_by',
+                                                 with_arguments=True)
 
   head_distinct = Split(head, 'distinct')
   if len(head_distinct) == 1:
     
-    parsed_head_call, is_distinct = ParseHeadCall(head)
+    parsed_head_call, is_distinct = ParseHeadCall(head,
+                                                  distinct_from_outside=False)
     if not parsed_head_call:
       raise ParsingException(
           'Could not parse head of a rule.', head)
@@ -1268,7 +1349,8 @@ def ParseRule(s: HeritageAwareString) -> Dict:
     if not (len(head_distinct) == 2 and not head_distinct[1]):
       raise ParsingException('Can not parse rule head. Something is wrong with '
                              'how >>distinct<< is used.', head)
-    parsed_head_call, is_distinct = ParseHeadCall(head_distinct[0])
+    parsed_head_call, is_distinct = ParseHeadCall(head_distinct[0],
+                                                  distinct_from_outside=True)
     result = {'head': parsed_head_call,
               'distinct_denoted': True}
   if couldbe:
@@ -1277,6 +1359,10 @@ def ParseRule(s: HeritageAwareString) -> Dict:
     result['cantbe_denoted'] = True
   if shouldbe:
     result['shouldbe_denoted'] = True
+  if order_by:
+    result['orderby_denoted'] = order_by_what
+  if limit:
+    result['limit_denoted'] = limit_what
   if len(parts) == 2:
     body = parts[1]
     result['body'] = ParseProposition(body)
@@ -1662,9 +1748,47 @@ class AggergationsAsExpressions(object):
     return rules
 
 
+def AnnotationsFromDenotations(rule):
+  def ShiftArgs(fvs):
+    for fv in fvs:
+      fv['field'] += 1
+  result = []
+  for denotation, annotation in [('orderby_denoted', '@OrderBy'),
+                                 ('limit_denoted', '@Limit')]:
+    if denotation in rule:
+      ShiftArgs(rule[denotation]['field_value'])
+      result.append({'full_text': rule['full_text'],
+                    'head': {
+                      'predicate_name': annotation,
+                      'record': {
+                        'field_value': [{
+                          'field': 0,
+                          'value': {
+                            'expression': {
+                              'literal': {
+                                'the_predicate': {
+                                  'predicate_name': rule['head']['predicate_name']
+                                }
+                              }
+                            }
+                          }
+                        }] + rule[denotation]['field_value']
+                      }
+                    }})
+  return result
+
+
+
 def ParseFile(s, this_file_name=None, parsed_imports=None, import_chain=None,
               import_root=None):
   """Parsing logica.Logica."""
+  if logica_parse_cpp.UseCppParser():
+    return logica_parse_cpp.ParseFile(
+        s,
+        import_root=import_root,
+        this_file_name=this_file_name or 'main',
+        exception_thrower=ParsingException)
+
   if (this_file_name or 'main') == 'main':
     # Enable experimental features if requested.
     EnactIncantations(s)
@@ -1704,6 +1828,8 @@ def ParseFile(s, this_file_name=None, parsed_imports=None, import_chain=None,
       rule = ParseFunctorRule(HeritageAwareString(str_statement))
     if not rule:
       rule = ParseRule(HeritageAwareString(str_statement))
+      if rule:
+        rules.extend(AnnotationsFromDenotations(rule))
 
     if rule:
       rules.append(rule)

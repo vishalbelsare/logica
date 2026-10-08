@@ -18,11 +18,13 @@
 
 from decimal import Decimal
 import getpass
+import io
 import json
 import re
 
 from .common import color
 from .common import concertina_lib
+from .common import clickhouse_logica
 from .common import duckdb_logica
 from .common import psql_logica
 
@@ -186,7 +188,7 @@ def RunSQL(sql, engine, connection=None, is_final=False):
       rows = cursor.fetchall()
       df = pandas.DataFrame(
         rows, columns=[d[0] for d in cursor.description])
-      df = df.applymap(psql_logica.DigestPsqlType)
+      df = df.map(psql_logica.DigestPsqlType)
       return df
     else:
       psql_logica.PostgresExecute(sql, connection)
@@ -215,9 +217,39 @@ def RunSQL(sql, engine, connection=None, is_final=False):
       ShowError("Error while executing SQL:\n%s" % e)
       raise e
     return None
+  elif engine == 'clickhouse':
+    # ClickHouse runner uses HTTP and doesn't require a DB-API connection.
+    # For the final predicate we return a DataFrame for display.
+    # For non-final statements we execute raw statements (DDL-safe).
+    if is_final:
+      try:
+        engine_settings = dict(connection or {})
+        engine_settings['settings'] = dict(engine_settings.get('settings') or {})
+        engine_settings['settings']['output_format_json_named_tuples_as_objects'] = 1
+
+        json_text = clickhouse_logica.RunQuery(
+          sql,
+          output_format='json',
+          engine_settings=engine_settings)
+        if not json_text.strip():
+          return pandas.DataFrame()
+        return pandas.read_json(io.StringIO(json_text), lines=True)
+      except clickhouse_logica.ClickHouseQueryError as e:
+        print("\n--- SQL ---")
+        print(sql)
+        ShowError(clickhouse_logica.FormatQueryError(e))
+        raise
+    else:
+      try:
+        clickhouse_logica.RunStatement(sql, engine_settings=connection)
+        return None
+      except clickhouse_logica.ClickHouseQueryError as e:
+        print("\n--- SQL ---")
+        print(sql)
+        ShowError(clickhouse_logica.FormatQueryError(e))
+        raise
   else:
-    raise Exception('Logica only supports BigQuery, PostgreSQL and SQLite '
-                    'for now.')
+    raise Exception('Unsupported engine: %s' % engine)
 
 
 def Ingress(table_name, csv_file_name):
@@ -253,7 +285,7 @@ class DuckdbRunner(object):
   def GetGlobalConnection(cls):
     global DB_CONNECTION
     if not DB_CONNECTION:
-      DB_CONNECTION = duckdb.connect()
+      DB_CONNECTION = duckdb_logica.GetConnection()
     return DB_CONNECTION
   
   @classmethod
@@ -279,6 +311,8 @@ class PostgresRunner(object):
       if user_choice != 'y':
         print('User declined.')
         print('Bailing out.')
+        print('You can run colab_logica.ConnectToPostgres() '
+              'to connect.')
         return
       PostgresJumpStart()
     self.connection = DB_CONNECTION
@@ -310,6 +344,16 @@ class ExecutionObserver:
   def RegisterTableLocation(self, predicate, table_location):
     self.table_locations[predicate] = table_location 
 
+CONNECTION_USED = None
+
+
+class ClickHouseRunner(object):
+  def __init__(self, engine_settings=None):
+    # We pass engine_settings via the "connection" parameter of RunSQL.
+    self.engine_settings = engine_settings or {}
+
+  def __call__(self, sql, engine, is_final):
+    return RunSQL(sql, engine, connection=self.engine_settings, is_final=is_final)
 
 def Logica(line, cell, run_query):
   """Running Logica predicates and storing results."""
@@ -414,6 +458,9 @@ def Logica(line, cell, run_query):
     elif engine == 'duckdb':
       if program.NeedsClingo():
         sql_runner = DuckdbRunner(program)
+        # Storing connection for debugging.
+        global CONNECTION_USED
+        CONNECTION_USED = sql_runner.connection
       else:
         # Let users set stuff in default connection unless
         # clingo is actually needed.
@@ -421,15 +468,25 @@ def Logica(line, cell, run_query):
     elif engine == 'bigquery':
       EnsureAuthenticatedUser()
       sql_runner = RunSQL
+    elif engine == 'clickhouse':
+      # Connection settings can be provided via @Engine("clickhouse", ...)
+      # annotation or environment variables (see common/clickhouse_logica.py).
+      engine_settings = (
+        program.annotations.annotations.get('@Engine', {})
+          .get('clickhouse', {}))
+      sql_runner = ClickHouseRunner(engine_settings=engine_settings)
     else:
-      raise Exception('Logica only supports BigQuery, PostgreSQL and SQLite '
-                      'for now.')   
+      raise Exception('Unsupported engine: %s' % engine)
     try:
       result_map = concertina_lib.ExecuteLogicaProgram(
         executions, sql_runner=sql_runner, sql_engine=engine,
         display_mode=DISPLAY_MODE,
         observer=observer)
     except infer.TypeErrorCaughtException as e:
+      e.ShowMessage()
+      return
+    except rule_translate.RuleCompileException as e:
+      # E.g. a neural plan may reject a program at execution time.
       e.ShowMessage()
       return
 
@@ -498,3 +555,11 @@ colab_logica.SetDbConnection(connection)
   print('Installation succeeded. Connecting...')
   # Connect to the database.
   ConnectToLocalPostgres()
+
+
+def UseCppParser():
+  os.environ['LOGICA_PARSER'] = 'CPP'
+  from .parser_cpp import logica_parse_cpp  # type: ignore
+  so_path = logica_parse_cpp.EnsureCppParserSharedObject()
+  logica_parse_cpp.LoadCppParserLib()
+  return so_path

@@ -15,7 +15,7 @@
 
 @Engine("duckdb");
 
-@Recursive(N, ∞, stop: S);
+@Recursive(N, ∞, mode: "iterative", stop: S);
 N() = 0 :- ~N();
 N() = N() + 1;
 

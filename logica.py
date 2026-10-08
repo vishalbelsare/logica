@@ -43,6 +43,7 @@ import sys
 if __name__ == '__main__' and not __package__:
   from common import color
   from common import sqlite3_logica
+  from common import clickhouse_logica
   from common import clingo_logica
   from common import duckdb_logica
   from compiler import functors
@@ -52,9 +53,12 @@ if __name__ == '__main__' and not __package__:
   from type_inference.research import infer
   from type_inference import type_retrieval_service_discovery
   from tools import proposition_repl
+  from tools import tranc
+  from tools import build_extension
 else:
   from .common import color
   from .common import sqlite3_logica
+  from .common import clickhouse_logica
   from .common import clingo_logica
   from .common import duckdb_logica
   from .compiler import functors
@@ -64,6 +68,8 @@ else:
   from .type_inference.research import infer
   from .type_inference import type_retrieval_service_discovery
   from .tools import proposition_repl
+  from .tools import tranc
+  from .tools import build_extension
 
 
 def ReadUserFlags(rules, argv):
@@ -130,8 +136,12 @@ def main(argv):
     print('  logica <l file> <command> <predicate name> [flags]')
     print('  Commands are:')
     print('    print: prints the StandardSQL query for the predicate.')
-    print('    run: runs the StandardSQL query on BigQuery with pretty output.')
-    print('    run_to_csv: runs the query on BigQuery with csv output.')
+    print('    run: runs the predicate, prints the result.')
+    print('    run_to_csv: runs the predicate, prints the result as csv.')
+    print('    run_raw_sql: runs the StandardSQL query of the predicate '
+          'as-is.')
+    print('    run_raw_sql_to_csv: runs the StandardSQL query of the '
+          'predicate as-is, prints the result as csv.')
 
     print('')
     print('')
@@ -141,7 +151,10 @@ def main(argv):
     return 1
 
   if len(argv) == 3 and argv[2] in ['parse', 'infer_types', 'show_signatures',
-                                    'propositional_playground']:
+                                    'propositional_playground',
+                                    'trancpy', 'trancpy_run',
+                                    'build_extension',
+                                    'install_extension']:
     pass  # compile needs just 2 actual arguments.
   else:
     if len(argv) < 4:
@@ -157,9 +170,12 @@ def main(argv):
 
   command = argv[2]
 
-  commands = ['parse', 'print', 'run', 'run_to_csv', 'run_in_terminal',
+  commands = ['parse', 'print', 'run', 'run_to_csv', 'run_raw_sql',
+              'run_raw_sql_to_csv', 'run_in_terminal',
               'infer_types', 'show_signatures', 'build_schema',
-              'propositional_playground', 'print_clingo', 'run_clingo']
+              'propositional_playground', 'print_clingo', 'run_clingo',
+              'trancpy', 'trancpy_run', 'build_extension',
+              'install_extension', 'tensor_diagnostics']
 
   if command not in commands:
     print(color.Format('Unknown command {warning}{command}{end}. '
@@ -176,8 +192,84 @@ def main(argv):
       from tools import run_in_terminal
     else:
       from .tools import run_in_terminal
-    artistic_table = run_in_terminal.Run(filename, predicates)
-    print(artistic_table)
+    if ',' in predicates:
+      artistic_tables = run_in_terminal.RunMany(filename, predicates.split(','))
+      for name, table in artistic_tables.items():
+        k = len(table.split('\n')[0]) - 4 - len(name)
+        n = k // 2
+        m = k - n
+        print(f'|{"=" * n} %s {"=" * m}|' % name)
+        print(table)
+    else:
+      artistic_table = run_in_terminal.Run(filename, predicates)
+      print(artistic_table)
+    return
+
+  # How the predicates of a recursive component behave as tensors in
+  # neural execution: the component's plan prints the report instead of
+  # iterating; the predicate's (empty) result is discarded.
+  if command == 'tensor_diagnostics':
+    os.environ['LOGICA_TENSOR_DIAGNOSTICS'] = predicates
+    if __name__ == '__main__' and not __package__:
+      from tools import run_in_terminal
+    else:
+      from .tools import run_in_terminal
+    run_in_terminal.Run(filename, predicates,
+                        output_format='header_rows',
+                        display_mode='silent')
+    return
+
+  # Like run_in_terminal, but only the result is printed.
+  if command == 'run' or command == 'run_to_csv':
+    if __name__ == '__main__' and not __package__:
+      from tools import run_in_terminal
+    else:
+      from .tools import run_in_terminal
+    try:
+      parsed_rules = parse.ParseFile(open(filename).read(),
+                                     import_root=GetImportRoot())['rule']
+    except parse.ParsingException as parsing_exception:
+      parsing_exception.ShowMessage()
+      sys.exit(1)
+    user_flags = ReadUserFlags(parsed_rules, argv[4:])
+    output_format = ('header_rows' if command == 'run_to_csv'
+                     else 'artistic_table')
+    predicates_list = predicates.split(',')
+    if len(predicates_list) > 1:
+      results = run_in_terminal.RunMany(filename, predicates_list,
+                                        output_format=output_format,
+                                        display_mode='silent',
+                                        user_flags=user_flags,
+                                        rules=parsed_rules)
+    else:
+      results = {predicates: run_in_terminal.Run(filename, predicates,
+                                                 output_format=output_format,
+                                                 display_mode='silent',
+                                                 user_flags=user_flags,
+                                                 rules=parsed_rules)}
+    for predicate_name in predicates_list:
+      if command == 'run_to_csv':
+        header, rows = results[predicate_name]
+        print(sqlite3_logica.Csv(header, rows), flush=True)
+      else:
+        print(results[predicate_name], flush=True)
+    return
+
+  if command == 'trancpy':
+    exe_path = filename.removesuffix('.py')
+    tranc.CompileTo(tranc.transpile(open(filename).read()), exe_path)
+    return
+
+  if command == 'trancpy_run':
+    tranc.CompileAndRun(tranc.transpile(open(filename).read()))
+    return
+
+  if command == 'build_extension':
+    build_extension.BuildExtension(filename)
+    return
+
+  if command == 'install_extension':
+    build_extension.BuildExtension(filename, install=True)
     return
 
   program_text = open(filename).read()
@@ -201,9 +293,10 @@ def main(argv):
   if command == 'infer_types':
     # This disallows getting types of program with type errors.
     # logic_program = universe.LogicaProgram(parsed_rules)
-    # TODO: Find a way to get engine from program. But it should not matter
-    # for inference. It only patters for compiling.
-    typing_engine = infer.TypesInferenceEngine(parsed_rules, "psql")
+    # Dialect mostly doesn't matter for inference itself, but it does matter
+    # for dialect-specific type renderings stored in the syntax tree.
+    annotations = universe.Annotations(parsed_rules, user_flags={})
+    typing_engine = infer.TypesInferenceEngine(parsed_rules, annotations.Engine())
     typing_engine.InferTypes()
     # print(parsed_rules)
     print(json.dumps(parsed_rules, sort_keys=True, indent=' '))
@@ -265,14 +358,24 @@ def main(argv):
       sys.exit(1)
 
     if command == 'print':
+      if logic_program.execution.iterations:
+        print('SELECT Error("This program requires iteration '
+              'via Concertina engine.");')
       print(formatted_sql)
 
     engine = logic_program.annotations.Engine()
 
-    if command == 'run' or command == 'run_to_csv':
+    if command == 'run_raw_sql' or command == 'run_raw_sql_to_csv':
+      if logic_program.execution.iterations:
+        print(color.Format(
+            '[ {error}Error{end} ] This program requires iteration via '
+            'Concertina engine. Use the {warning}run{end} or '
+            '{warning}run_to_csv{end} command.'))
+        sys.exit(1)
       # We should split and move this logic to dialects.
       if engine == 'bigquery':
-        output_format = 'csv' if command == 'run_to_csv' else 'pretty'
+        output_format = ('csv' if command == 'run_raw_sql_to_csv'
+                         else 'pretty')
         p = subprocess.Popen(['bq', 'query',
                               '--use_legacy_sql=false',
                               '--format=%s' % output_format],
@@ -280,7 +383,7 @@ def main(argv):
         o, _ = p.communicate(formatted_sql.encode())
       elif engine == 'sqlite':
         # TODO: Make multi-statement scripts work.
-        format = ('artistictable' if command == 'run' else 'csv')
+        format = ('artistictable' if command == 'run_raw_sql' else 'csv')
         statements_to_execute = (
           [preamble] + defines_and_exports + [main_predicate_sql])
         o = sqlite3_logica.RunSqlScript(statements_to_execute,
@@ -289,7 +392,7 @@ def main(argv):
         connection = duckdb_logica.GetConnection(logic_program)
         cur = connection.sql(formatted_sql)
         formatter = (sqlite3_logica.ArtisticTable
-                     if command == 'run'
+                     if command == 'run_raw_sql'
                      else sqlite3_logica.Csv)
         o = formatter(cur.columns,
                       cur.fetchall()).encode()
@@ -308,7 +411,8 @@ def main(argv):
                                            rows).encode()
         else:
           p = subprocess.Popen(['psql', '--quiet'] +
-                              (['--csv'] if command == 'run_to_csv' else []),
+                              (['--csv']
+                               if command == 'run_raw_sql_to_csv' else []),
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE)
           commands = []
           o, _ = p.communicate(
@@ -318,10 +422,25 @@ def main(argv):
         params = GetTrinoParameters(a)
         p = subprocess.Popen(['trino'] + params +
                              (['--output-format=CSV_HEADER_UNQUOTED']
-                              if command == 'run_to_csv' else
+                              if command == 'run_raw_sql_to_csv' else
                               ['--output-format=ALIGNED']),
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         o, _ = p.communicate(formatted_sql.encode())
+      elif engine == 'clickhouse':
+        engine_settings = {}
+        if ('@Engine' in logic_program.annotations.annotations and
+            'clickhouse' in logic_program.annotations.annotations['@Engine']):
+          engine_settings = logic_program.annotations.annotations['@Engine']['clickhouse']
+        output_format = ('csv' if command == 'run_raw_sql_to_csv'
+                         else 'pretty')
+        try:
+          o = clickhouse_logica.RunQueryCli(
+              formatted_sql,
+              output_format=output_format,
+              engine_settings=engine_settings)
+        except clickhouse_logica.ClickHouseCliError as e:
+          print(str(e))
+          sys.exit(1)
       elif engine == 'presto':
         a = logic_program.annotations.annotations['@Engine']['presto']
         catalog = a.get('catalog', 'memory')
@@ -331,13 +450,16 @@ def main(argv):
                               '--server=%s' % server,
                               '--file=/dev/stdin'] +
                              (['--output-format=CSV_HEADER_UNQUOTED']
-                              if command == 'run_to_csv' else
+                              if command == 'run_raw_sql_to_csv' else
                               ['--output-format=ALIGNED']),
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         o, _ = p.communicate(formatted_sql.encode())
       else:
         assert False, 'Unknown engine: %s' % engine
-      print(o.decode())
+      try:
+          print(o.decode(), flush=True)
+      except BrokenPipeError:
+          pass
 
 
 def run_main():

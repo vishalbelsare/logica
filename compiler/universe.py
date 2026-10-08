@@ -19,6 +19,7 @@
 
 import collections
 import copy
+import os
 import re
 import sys
 import traceback
@@ -32,6 +33,7 @@ if '.' not in __package__:
   from compiler import dialects
   from compiler import expr_translate
   from compiler import functors
+  from compiler import neural_logica
   from compiler import rule_translate
   from parser_py import parse
   from type_inference.research import infer
@@ -40,6 +42,7 @@ else:
   from ..compiler import dialects
   from ..compiler import expr_translate
   from ..compiler import functors
+  from ..compiler import neural_logica
   from ..compiler import rule_translate
   from ..parser_py import parse
   from ..type_inference.research import infer
@@ -152,7 +155,9 @@ class Annotations(object):
       '@Limit', '@OrderBy', '@Ground', '@Flag', '@DefineFlag',
       '@NoInject', '@Make', '@CompileAsTvf', '@With', '@NoWith',
       '@CompileAsUdf', '@ResetFlagValue', '@Dataset', '@AttachDatabase',
-      '@Engine', '@Recursive', '@Iteration', '@BareAggregation'
+      '@Engine', '@Recursive', '@Iteration', '@BareAggregation',
+      '@DifferentiallyPrivate',
+      '@Extension', '@NeuralTarget'
   ]
 
   def __init__(self, rules, user_flags):
@@ -204,7 +209,27 @@ class Annotations(object):
       if self.annotations['@Engine'].get('duckdb', {}).get('threads'):
         threads = int(self.annotations['@Engine'].get('duckdb', {}).get('threads'))
         preamble += 'set threads to %d;\n' % threads
+      extensions = self.annotations['@Engine'].get('duckdb', {}).get('extensions')
+      if extensions:
+        if isinstance(extensions, str):
+          extensions = [extensions]
+        for ext in extensions:
+          preamble += "LOAD '%s';\n" % self.ResolveExtension(ext)
+      for ext_name in self.annotations.get('@Extension', {}):
+        preamble += "LOAD '%s';\n" % self.ResolveExtension(ext_name)
     return preamble
+
+  @staticmethod
+  def ResolveExtension(ext):
+    if not ext.endswith('.duckdb_extension'):
+      ext = ext + '.duckdb_extension'
+    if os.path.isabs(ext) or os.path.exists(ext):
+      return ext
+    global_path = os.path.join(
+        os.path.expanduser('~'), '.logica', 'extensions', ext)
+    if os.path.exists(global_path):
+      return global_path
+    return ext
 
   def BuildFlagValues(self):
     """Building values by overriding defaults with user flags."""
@@ -299,7 +324,9 @@ class Annotations(object):
       predicates = [p['predicate_name'] for p in args['predicates']]
       result[iteration_name] = {'predicates': predicates,
                                 'repetitions': args['repetitions'],
-                                'stop_signal': args.get('stop_signal')}
+                                'stop_signal': args.get('stop_signal'),
+                                'stop_cadence': args.get('stop_cadence'),
+                                'mode': args.get('mode')}
     return result
 
   def LimitOf(self, predicate_name):
@@ -324,6 +351,8 @@ class Annotations(object):
     # This change is intended for all engines in the future.
     if self.Engine() in ['psql', 'duckdb']:
       default_dataset = 'logica_home'
+    if self.Engine() == 'clickhouse':
+      default_dataset = 'default'
     if self.Engine() == 'sqlite' and 'logica_home' in self.AttachedDatabases():
       default_dataset = 'logica_home'
     return self.ExtractSingleton('@Dataset', default_dataset)
@@ -336,7 +365,7 @@ class Annotations(object):
     return engine
  
   def EngineTypechecksByDefault(self, engine):
-    return engine in ['psql', 'duckdb']
+    return engine in ['psql', 'duckdb', 'clickhouse']
 
   def ShouldTypecheck(self):
     engine = self.Engine()
@@ -600,6 +629,7 @@ class LogicaProgram(object):
               list(set(self.dollar_params) - set(self.flag_values))),
           str(list(set(self.dollar_params) - set(self.flag_values))))
     self.functors = None
+    self.neural_plans = {}  # Compiled after type inference below.
 
     # Extending rules with functors.
     extended_rules = self.RunMakes(rules)  # Populates self.functors.
@@ -609,6 +639,21 @@ class LogicaProgram(object):
         dialects.Get(self.annotations.Engine()).LibraryProgram())['rule']
     extended_rules.extend(library_rules)
 
+    # A functor copy of a neural recursion carries the diamonds but not
+    # the iteration or the portal state: complete such islands from the
+    # names (X_portal is always logically X).
+    neural_logica.CompleteFunctorIslands(extended_rules)
+
+    # Neural iterations and neural targets read their input relations
+    # from tables: ground the inputs. Functors already know the
+    # dependencies.
+    neural_logica.AppendAutoGrounds(extended_rules, self.functors)
+
+    # Column classes are extracted from the final rules: machinery reads
+    # are physical after unfolding, functor copies are self-contained
+    # families, and phases funnel onto their family by name.
+    self.column_classes = neural_logica.ExtractColumnClasses(extended_rules)
+
     for rule in extended_rules:
       predicate_name = rule['head']['predicate_name']
       self.defined_predicates.add(predicate_name)
@@ -617,6 +662,7 @@ class LogicaProgram(object):
     # We need to recompute annotations, because 'Make' created more rules and
     # annotations.
     self.annotations = Annotations(extended_rules, self.user_flags)
+    neural_logica.CheckNeuralPredicatesIterate(self.annotations)
 
     # Infering types if requested.
     self.typing_preamble = ''
@@ -625,6 +671,11 @@ class LogicaProgram(object):
     self.typing_engine = None
     if self.annotations.ShouldTypecheck():
       self.typing_preamble = self.RunTypechecker()
+
+    # Plans of neural iterations are a pure function of the program:
+    # compiled here once, attached to every execution's iterations in
+    # InitializeExecution.
+    self.neural_plans = neural_logica.CompilePlans(self)
 
     # Build udfs, populating custom_udfs and custom_udf_definitions.
     self.BuildUdfs()
@@ -674,31 +725,33 @@ class LogicaProgram(object):
           r['body'] = {'conjunction': {'conjunct': []}}
         r['body']['conjunction']['satellites'] = [{'predicate_name': master[p]}]
 
-  def AddAutoStop(self, depth_map):
-    for k in depth_map:
-      if ('1' in depth_map[k] and
-          depth_map[k]['1'] == -1 and
-          'stop' not in depth_map[k]):
-        depth_map[k]['stop'] = {'predicate_name': 'Stop' + k}
-
   def UnfoldRecursion(self, rules):
     annotations = Annotations(rules, {})
     depth_map = annotations.annotations.get('@Recursive', {})
-    self.AddAutoStop(depth_map)
+    # For @NeuralTarget(Loss, learn: [W]) the rules of W are renamed
+    # into W_init — the initialization — while W becomes a stored copy
+    # of W_init that training overwrites with learned values; a
+    # one-repetition @Iteration is added to run the training.
+    rules = neural_logica.RewriteNeuralTargets(rules)
     self.InscribeOrbits(rules, depth_map)
     f = functors.Functors(rules)
+    # Components of learning cones and join-classes of columns are
+    # extracted before recursion unfolding, while recursion is still
+    # visible as dependency cycles and every predicate bears its own
+    # name.
+    self.neural_components = neural_logica.ExtractNeuralComponents(f)
     # Annotations are not ready at this point.
     # if (self.execution.annotations.Engine() == 'duckdb'):
     #   for p in depth_map:
     #     # DuckDB struggles with long querries.
     #     depth_map[p]['iterative'] = True
     quacks_like_a_duck = (annotations.Engine() == "duckdb")
-    default_iterative = False
+    default_mode = None
     default_depth = 8
     if quacks_like_a_duck:
-      default_iterative = True
+      default_mode = 'diamond'
       default_depth = 32
-    return f.UnfoldRecursions(depth_map, default_iterative, default_depth)
+    return f.UnfoldRecursions(depth_map, default_mode, default_depth)
 
   def BuildUdfs(self):
     """Build UDF definitions."""
@@ -1024,6 +1077,8 @@ class LogicaProgram(object):
     self.execution.dependencies_of = self.functors.args_of
     self.execution.dialect = dialects.Get(self.annotations.Engine())
     self.execution.iterations = self.annotations.Iterations()
+    # Iterations marked neural execute as their compiled plans.
+    neural_logica.AttachPlans(self.neural_plans, self.execution.iterations)
   
   def UpdateExecutionWithTyping(self):
     if self.execution.dialect.IsPostgreSQLish():
@@ -1047,6 +1102,11 @@ class LogicaProgram(object):
             # We don't have actual dependency on top of stack, so we
             # do not add any dependency edge.
             translator.TranslateTable(d, None, edge_needed=False)
+    # Training is a collapsed dependency cycle: Weight <- Loss <-
+    # Prediction <- Weight spins inside one node. The scheduler sees the
+    # acyclic condensation, and here the collapsed loop receives its
+    # in-edges: dependencies on the data the loop consumes.
+    neural_logica.AddLearningLoopDependencies(self.execution, translator)
 
   def FormattedPredicateSql(self, name, allocator=None):
     """Printing top-level formatted SQL statement with defines and exports."""
@@ -1297,6 +1357,20 @@ class SubqueryTranslator(object):
     self.allocator = allocator
     self.execution = execution
 
+  def AddClickhouseDropAction(self, table, ground):
+    # Hacking because ClickHouse doesnt support multi-statements.
+    drop_action = '__drop__' + table
+    drop_statement = (
+        'DROP TABLE IF EXISTS %s%s' % (
+            ground.table_name,
+            self.execution.dialect.MaybeCascadingDeletionWord()))
+    drop_statement = FormatSql(drop_statement)
+    drop_statement = self.program.UseFlagsAsParameters(drop_statement)
+    self.execution.table_to_export_map[drop_action] = drop_statement
+    self.execution.export_statements.append(drop_statement)
+    self.execution.defines_and_exports.append(drop_statement)
+    self.execution.dependency_edges.append((drop_action, table))
+
   def TranslateTableAttachedToFile(self, table, ground, external_vocabulary,
                                    edge_needed=True):
     """Translates file-attached table. Appends exports and defines."""
@@ -1324,19 +1398,36 @@ class SubqueryTranslator(object):
 
       dependency_sql = self.program.UseFlagsAsParameters(dependency_sql)
       self.execution.workflow_predicates_stack.pop()
+      # This is buggy, but we never use overwrite.
       maybe_drop_table = (
           'DROP TABLE IF EXISTS %s%s;\n' % ((
               ground.table_name if ground.overwrite else '',
               self.execution.dialect.MaybeCascadingDeletionWord())))
+      is_duckdb = self.program.annotations.Engine() == 'duckdb'
+      if is_duckdb:
+        if ground.overwrite:
+          create_keyword = 'CREATE OR REPLACE TABLE'
+        else:
+          create_keyword = 'CREATE TABLE'
+        maybe_drop_table = ''
+      else:
+        create_keyword = 'CREATE TABLE'
+
       maybe_copy = ''
       if ground.copy_to_file:
         maybe_copy = f'COPY {ground.table_name} TO \'{ground.copy_to_file}\';\n'
-      export_statement = (
-          maybe_drop_table +
-          'CREATE TABLE {name} AS {dependency_sql}'.format(
+      create_statement = (
+          '{create_keyword} {name} AS {dependency_sql}'.format(
+              create_keyword=create_keyword,
               name=ground.table_name,
-              dependency_sql=FormatSql(dependency_sql)) +
-          maybe_copy)
+              dependency_sql=FormatSql(dependency_sql)))
+
+      if self.program.annotations.Engine() == 'clickhouse':
+        if ground.overwrite:
+          self.AddClickhouseDropAction(table, ground)
+        export_statement = create_statement
+      else:
+        export_statement = maybe_drop_table + create_statement + maybe_copy
 
       export_statement = self.program.UseFlagsAsParameters(export_statement)
       # It's cheap to store a string multiple times in Python, as it's stored

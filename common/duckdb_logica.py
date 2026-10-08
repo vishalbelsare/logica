@@ -41,7 +41,10 @@ display_id_counter = 0
 
 def GetConnection(logica_program=None):
   import duckdb
-  connection = duckdb.connect()
+  config = {
+      'allow_unsigned_extensions': 'true'
+  }
+  connection = duckdb.connect(config=config)
   if logica_program:
     a = logica_program.annotations.annotations
     clingo_settings = a.get('@Engine', {}).get('duckdb', {}).get('clingo', False)
@@ -81,17 +84,17 @@ def ConnectClingo(connection,
                               'value': str}))
 
   def RunClingo(program: str) -> list_of_models_type:
-    # Создаем контроллер и загружаем программу.
+    # Create the controller and load the program.
     ctl = clingo.Control()
     ctl.add("base", [], program)
     ctl.configuration.solve.models = default_num_models
     if default_opt_mode:
       ctl.configuration.solve.opt_mode = default_opt_mode
 
-    # Просим Clingo "заземлить" правила (подготовить к решению).
+    # Ask Clingo to ground the rules (prepare for solving).
     ctl.ground([("base", [])])
 
-    # Решаем и выводим результат.
+    # Solve and output the result.
     result = []
     with ctl.solve(yield_=True) as handle:
       for model_id, model in enumerate(handle):
@@ -168,8 +171,8 @@ def ConnectClingo(connection,
       pass
   connection.create_function('RunClingoFileTemplate', RunClingoFileTemplate)
 
-  def Clingo(predicates: duckdb.list_type(str),
-             within_model: model_type) -> list_of_models_type:
+  def CompileClingo(predicates: duckdb.list_type(str),
+                    within_model: model_type) -> str:
     if logica_program:
       for p in predicates:
         if p not in logica_program.functors.args_of:
@@ -192,6 +195,16 @@ def ConnectClingo(connection,
         within_model, from_logica=True))
     program = clingo_logica.Klingon(logical_context, predicates)
     full_program = context + '\n' + program
+    return full_program
+  try:
+      connection.remove_function('CompileClingo')
+  except:
+      pass
+  connection.create_function('CompileClingo', CompileClingo)
+
+  def Clingo(predicates: duckdb.list_type(str),
+             within_model: model_type) -> list_of_models_type:
+    full_program = CompileClingo(predicates, within_model)
     if debug_printing:
       print('=== Running Clingo ===')
       print('Predicates:', predicates)

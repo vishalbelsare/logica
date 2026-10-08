@@ -45,13 +45,129 @@ def RunTest(name, src=None, golden=None, predicate=None,
             duckify_psql=True)
 
 
-def RunAll(test_presto=False, test_trino=False, test_clingo=True):
+def NeuralTests():
+  """Tests of @Neural execution; need JAX."""
+  try:
+    import jax
+  except ImportError:
+    print('Skipping neural tests: JAX is not installed.')
+    return
+  RunTest('neural/neural_coordinate_use', src='neural/neural_coordinate_use.l',
+          golden='neural/neural_coordinate_use.txt', use_concertina=True)
+  RunTest('neural/neural_basic', src='neural/neural_basic.l',
+          golden='neural/neural_basic.txt', use_concertina=True)
+  RunTest('neural/neural_d', src='neural/neural_d.l',
+          golden='neural/neural_d.txt', use_concertina=True)
+  RunTest('neural/neural_pagerank', src='neural/neural_pagerank.l',
+          golden='neural/neural_pagerank.txt', use_concertina=True)
+  RunTest('neural/neural_flow', src='neural/neural_flow.l',
+          golden='neural/neural_flow.txt', use_concertina=True)
+  RunTest('neural/neural_counter', src='neural/neural_counter.l',
+          golden='neural/neural_counter.txt', use_concertina=True)
+  RunTest('neural/neural_static_hoist', src='neural/neural_static_hoist.l',
+          golden='neural/neural_static_hoist.txt', use_concertina=True)
+  RunTest('neural/neural_const_keys', src='neural/neural_const_keys.l',
+          golden='neural/neural_const_keys.txt', use_concertina=True)
+  RunTest('neural/neural_game_of_life', src='neural/neural_game_of_life.l',
+          golden='neural/neural_game_of_life.txt', use_concertina=True)
+  RunTest('neural/neural_hash_functions', src='neural/neural_hash_functions.l',
+          golden='neural/neural_hash_functions.txt', use_concertina=True)
+  RunTest('neural/neural_target_linear', src='neural/neural_target_linear.l',
+          golden='neural/neural_target_linear.txt', use_concertina=True)
+  RunTest('neural/neural_animal_fights', src='neural/neural_animal_fights.l',
+          golden='neural/neural_animal_fights.txt', use_concertina=True)
+  RunTest('neural/neural_mlp', src='neural/neural_mlp.l',
+          golden='neural/neural_mlp.txt', use_concertina=True)
+  RunTest('neural/neural_xor', src='neural/neural_xor.l',
+          golden='neural/neural_xor.txt', use_concertina=True)
+  RunTest('neural/neural_heat', src='neural/neural_heat.l',
+          golden='neural/neural_heat.txt', use_concertina=True)
+  RunTest('neural/neural_functor_walk', src='neural/neural_functor_walk.l',
+          golden='neural/neural_functor_walk.txt', use_concertina=True)
+  RunTest('neural/neural_stop', src='neural/neural_stop.l',
+          golden='neural/neural_stop.txt', use_concertina=True)
+  RunTest('neural/neural_flow_pairs', src='neural/neural_flow_pairs.l',
+          golden='neural/neural_flow_pairs.txt', use_concertina=True)
+  RunTest('neural/neural_bellman', src='neural/neural_bellman.l',
+          golden='neural/neural_bellman.txt', use_concertina=True)
+  TensorDiagnosticsTests()
+  NeuralDenseOracleTests()
+  LogixTests()
+
+
+def TensorDiagnosticsTests():
+  """Golden reports of tensor_diagnostics: does the compiler understand
+  the representation of every predicate of a recursive component."""
+  RunDiagnosticsTest('neural/diagnostics_pagerank',
+                     src='neural/neural_pagerank.l', predicate='PageRank',
+                     golden='neural/neural_pagerank_diagnostics.txt')
+  RunDiagnosticsTest('neural/diagnostics_flow',
+                     src='neural/neural_flow.l', predicate='Volume',
+                     golden='neural/neural_flow_diagnostics.txt')
+  RunDiagnosticsTest('neural/diagnostics_flow_pairs',
+                     src='neural/neural_flow_pairs.l', predicate='Volume',
+                     golden='neural/neural_flow_pairs_diagnostics.txt')
+
+
+def RunDiagnosticsTest(name, src, predicate, golden):
+  logica_test.TestManager.RunDiagnosticsTest(
+      name, src='integration_tests/' + src, predicate=predicate,
+      golden='integration_tests/' + golden)
+
+
+def NeuralDenseOracleTests():
+  """The whole neural battery with LOGICA_NEURAL_DENSE=1.
+
+  The sparse representation is a pure change of storage: forcing every
+  relation dense must reproduce the same goldens. A discrepancy between
+  the two passes localizes a bug to the representation layer."""
+  import os
+  os.environ['LOGICA_NEURAL_DENSE'] = '1'
+  try:
+    for name in ['neural_basic', 'neural_d', 'neural_pagerank',
+                 'neural_flow', 'neural_flow_pairs', 'neural_bellman',
+                 'neural_counter', 'neural_const_keys',
+                 'neural_static_hoist', 'neural_game_of_life',
+                 'neural_hash_functions', 'neural_target_linear',
+                 'neural_animal_fights', 'neural_mlp', 'neural_xor',
+                 'neural_heat', 'neural_functor_walk']:
+      RunTest('dense/' + name, src='neural/%s.l' % name,
+              golden='neural/%s.txt' % name, use_concertina=True)
+  finally:
+    os.environ.pop('LOGICA_NEURAL_DENSE')
+
+
+def LogixTests():
+  """Neural tests through the logix (pure numpy) tensor engine.
+
+  neural_coordinate_use is excluded on purpose: with epsilon: 0 its
+  stopping point is sensitive to the summation order of einsum, which
+  legitimately differs between XLA and numpy."""
+  import os
+  os.environ['LOGICA_TENSOR_ENGINE'] = 'numpy'
+  try:
+    for name in ['neural_basic', 'neural_d', 'neural_pagerank',
+                 'neural_flow', 'neural_counter', 'neural_const_keys',
+                 'neural_game_of_life', 'neural_hash_functions',
+                 'neural_target_linear', 'neural_animal_fights',
+                 'neural_mlp', 'neural_xor', 'neural_heat',
+                 'neural_functor_walk']:
+      RunTest('logix/' + name, src='neural/%s.l' % name,
+              golden='neural/%s.txt' % name, use_concertina=True)
+  finally:
+    os.environ.pop('LOGICA_TENSOR_ENGINE')
+
+
+def RunAll(test_presto=False, test_trino=False, test_clingo=True, test_clickhouse=False,
+           test_extension=False):
   """Running all tests."""
   # Uncomment to test writing tables.
   # RunTest("ground_test")
   # RunTest("ground_psql_test")
   # RunTest("closure_test")
   # RunTest("dialects/trino/grounding_test")
+
+  NeuralTests()
 
   if test_presto:
     RunTest("dialects/presto/basics_test")
@@ -65,8 +181,14 @@ def RunAll(test_presto=False, test_trino=False, test_clingo=True):
     RunTest("dialects/trino/joins_test")
     RunTest("dialects/trino/joins_test")
 
+  if test_clickhouse or logica_test.TestManager.RUN_ONLY:
+    RunTest("dialects/clickhouse/shipping_funfacts_test")
+    RunTest("dialects/clickhouse/purchase_test")
+
   if test_clingo:
     from common import duckdb_logica
+    RunTest("duckdb_clingo_blinking_test", use_concertina=True)
+    RunTest('clingo_recursive_test')
     RunTest('clingo_sum_test')
     RunTest('duckdb_clingo')
     RunTest('clingo_basic_test')
@@ -76,6 +198,30 @@ def RunAll(test_presto=False, test_trino=False, test_clingo=True):
     RunTest('extract_clingo_test')
     RunTest('clingo_pipeline_test', use_concertina=True)
 
+  if test_extension or logica_test.TestManager.RUN_ONLY:
+    RunTest('duckdb_timeline_test')
+    RunTest('duckdb_tkp_test', use_concertina=True)
+    RunTest('duckdb_tkp_learn_test', use_concertina=True,
+            predicate='Report')
+    RunTest('duckdb_tkp_grid_test', use_concertina=True,
+            predicate='Report')
+    RunTest('duckdb_tkp_grid_edges_test', src='duckdb_tkp_grid_test.l',
+            use_concertina=True, predicate='Edges')
+    RunTest('duckdb_tkp_hop_test', use_concertina=True,
+            predicate='Report')
+    RunTest('duckdb_tkp_grid_jax_test', use_concertina=True,
+            predicate='Report')
+    RunTest('duckdb_tkp_parity_test', use_concertina=True,
+            predicate='Report')
+    RunTest('duckdb_tkp_parity_neural_test', use_concertina=True,
+            golden='duckdb_tkp_parity_test.txt', predicate='Report')
+
+  RunTest("duckdb_plusplus_agg_test")
+
+  RunTest("duckdb_json_test")
+  RunTest("orderby_limit_test")
+  RunTest("strategic_test")
+  RunTest("string_screening_test")
   RunTest("propositional_implication_test")
 
   RunTest("duckdb_negation_test")
@@ -130,6 +276,11 @@ def RunAll(test_presto=False, test_trino=False, test_clingo=True):
           use_concertina=True)
   RunTest("duckdb_iteration_closure_test",
           use_concertina=True)
+  RunTest("duckdb_diamond_abc_test",
+          use_concertina=True)
+  RunTest("duckdb_diamond_stop_order_test", use_concertina=True)
+  RunTest("duckdb_diamond_fixpoint_test", use_concertina=True)
+  RunTest("duckdb_diamond_fixpoint_tc_test", use_concertina=True)
   RunTest("duckdb_stop_test",
           src="duckdb_stop_test.l",
           use_concertina=True)

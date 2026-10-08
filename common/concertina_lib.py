@@ -52,10 +52,27 @@ class ConcertinaQueryEngine(object):
         if self.observer:
           self.observer.ObserveTable(predicate, result)
 
+  def RunPlan(self, iteration_name, plan, progress=None):
+    """Runs a whole iteration as a single Python plan (e.g. neural recursion)."""
+    if self.print_running_predicate:
+      print('Running iteration:', iteration_name, end='')
+    start = datetime.datetime.now()
+    stats = plan.Run(self.sql_runner, progress=progress)
+    end = datetime.datetime.now()
+    self.completion_time[iteration_name] = int(
+        (end - start).total_seconds() * 1000)
+    if self.print_running_predicate:
+      print(' (%d ms)' % self.completion_time[iteration_name])
+    return stats
+
 
 class ConcertinaDryRunEngine(object):
   def Run(self, action):
     print(action)
+
+  def RunPlan(self, iteration_name, plan, progress=None):
+    print('Python plan of iteration %s:' % iteration_name, plan)
+    return {}
 
 
 class Concertina(object):
@@ -69,8 +86,20 @@ class Concertina(object):
   def SortActions(self):
     # Sorting so that:
     # 1. Order respects dependency.
-    # 2. Iterations come together.
+    # 2. Iterations come together, in the order specified in @Iteration.
+    # 3. Lex tiebreak for full determinism.
     actions_to_assign = {a['name'] for a in self.config}
+
+    atamans = []
+    for a in actions_to_assign:
+      if a not in self.action_iteration:
+        atamans.append(a)
+      elif self.iteration_actions[self.action_iteration[a]][0] == a:
+        atamans.append(a)
+      else:
+        pass  # Hold on cossack!
+    atamans = set(atamans)
+
     complete = set()
     result = []
     assigning_iteration = None
@@ -78,10 +107,17 @@ class Concertina(object):
     while actions_to_assign:
       remains = len(actions_to_assign)
       if assigning_iteration:
-        eligible = actions_to_assign & self.iteration_actions[assigning_iteration]
+        # Just get the whole iteration onto the wagon!
+        eligible = [a for a in self.iteration_actions[assigning_iteration]
+                    if a in actions_to_assign]
+        result += eligible
+        complete |= set(eligible)
+        actions_to_assign -= set(eligible)
+        assigning_iteration = None
+        continue
       else:
-        eligible = actions_to_assign
-      for a in list(eligible):
+        eligible = sorted(actions_to_assign & atamans)
+      for a in eligible:
         if complete >= set(self.action_requires[a]):
           result.append(a)
           if a in self.action_iteration:
@@ -92,7 +128,8 @@ class Concertina(object):
           complete |= {a}
           actions_to_assign -= {a}
           if assigning_iteration:
-            if not (self.iteration_actions[assigning_iteration] & actions_to_assign):
+            if not (set(self.iteration_actions[assigning_iteration]) &
+                    actions_to_assign):
               assigning_iteration = None
           if exit_for:
             exit_for = False
@@ -123,7 +160,7 @@ class Concertina(object):
       for p in self.iterations[iteration]['predicates']
     }
     self.iteration_actions = {
-      iteration: set(self.iterations[iteration]['predicates'])
+      iteration: list(self.iterations[iteration]['predicates'])
       for iteration in self.iterations
     }
     self.iteration_stop_signal = {
@@ -133,9 +170,14 @@ class Concertina(object):
     self.half_iteration_actions = {}
     for iteration in self.iterations:
       predicates = self.iterations[iteration]['predicates']
-      assert len(predicates) % 2 == 0, predicates
-      self.half_iteration_actions[iteration+'_upper'] = set(predicates[:(len(predicates) // 2)])
-      self.half_iteration_actions[iteration+'_lower'] = set(predicates[(len(predicates) // 2):])
+      if self.iterations[iteration].get('mode') == 'diamond':
+        upper, lower = predicates, []
+      else:
+        assert len(predicates) % 2 == 0, predicates
+        mid = len(predicates) // 2
+        upper, lower = predicates[:mid], predicates[mid:]
+      self.half_iteration_actions[iteration+'_upper'] = set(upper)
+      self.half_iteration_actions[iteration+'_lower'] = set(lower)
     self.action_half_iteration = {}
     for hi, ps in self.half_iteration_actions.items():
       for p in ps:
@@ -176,7 +218,11 @@ class Concertina(object):
     self.all_actions = {a["name"] for a in self.config}
     self.complete_actions = set()
     self.running_actions = set()
-    assert display_mode in ('colab', 'terminal', 'colab-text', 'silent'), (
+    self.show_only_running = False
+    if os.getenv('LOGICA_TERMINAL_ONELINE', 'no') == 'yes':
+      self.show_only_running = True
+    assert display_mode in ('colab', 'terminal',
+                            'colab-text', 'silent'), (
       'Unrecognized display mode: %s' % display_mode)
     self.display_mode = display_mode
     self.display_id = self.GetDisplayId()
@@ -184,10 +230,17 @@ class Concertina(object):
 
   def ActionIterationStopSignal(self, action):
     return self.iteration_stop_signal[self.action_iteration[action]]
-  
+
+  def ActionIterationStopCadence(self, action):
+    return self.iterations[self.action_iteration[action]].get(
+        'stop_cadence') or 1
+
   def ActionIterationWantsToStopBySignal(self, action):
     signal = self.ActionIterationStopSignal(action)
     if not signal:
+      return False
+    if (self.action_iterations_complete[action] %
+        self.ActionIterationStopCadence(action)):
       return False
     if signal in self.wrench_in_gears:
       return True
@@ -224,6 +277,10 @@ class Concertina(object):
     # self.UpdateDisplay()
     one_action = self.actions_to_run[0]
     del self.actions_to_run[0]
+    iteration = self.action_iteration.get(one_action)
+    if iteration and self.iterations[iteration].get('plan') is not None:
+      self.RunIterationAsPlan(iteration)
+      return
     self.running_actions |= {one_action}
     self.UpdateDisplay()
     self.engine.Run(self.action[one_action].get('action', {}))
@@ -233,6 +290,45 @@ class Concertina(object):
     else:
       self.UpdateStateForIterativeAction(one_action)
     # self.UpdateDisplay()
+
+  def RunIterationAsPlan(self, iteration):
+    """Runs the whole iteration as a single Python plan (e.g. neural recursion)."""
+    members = [a for a in self.iteration_actions[iteration]
+               if a in self.action]
+    self.running_actions |= set(members)
+    self.UpdateDisplay()
+
+    def Progress(sweeps):
+      for a in members:
+        self.action_iterations_complete[a] = sweeps
+      self.UpdateDisplay()  # Internally throttled.
+
+    stats = self.engine.RunPlan(iteration, self.iterations[iteration]['plan'],
+                                progress=Progress)
+    self.running_actions -= set(members)
+    # The plan ran the whole iteration: display the number of sweeps it
+    # actually took and retire all of the iteration's actions.
+    executed = stats.get('iterations', 1) if stats else 1
+    self.iteration_repetitions[iteration] = executed
+    completion_time = getattr(self.engine, 'completion_time', {})
+    # The plan wrote the learned tables back, but the members' query
+    # actions never ran. Final predicates among the members still need
+    # a query to deliver the result to the caller — reading the
+    # written-back table, not the member's defining SQL: for a learned
+    # predicate the latter reads the initialization.
+    written_tables = getattr(self.iterations[iteration].get('plan'),
+                             'written_tables', {})
+    for a in members:
+      if self.action[a].get('type') == 'final':
+        action = dict(self.action[a].get('action', {}))
+        if a in written_tables:
+          action['sql'] = 'SELECT * FROM %s;' % written_tables[a]
+        self.engine.Run(action)
+    for a in members:
+      self.action_iterations_complete[a] = executed
+      self.complete_actions |= {a}
+      completion_time.setdefault(a, completion_time.get(iteration, 0))
+    self.actions_to_run = [a for a in self.actions_to_run if a not in members]
 
   def Run(self):
     while self.actions_to_run:
@@ -265,7 +361,9 @@ class Concertina(object):
   def AsGraphViz(self):
     def NodeText(node):
       if node in self.action_iteration:
-        maybe_iteration_info = ' %d / %s' % (
+        # The completion may be a stage word ('probe', 'compiling')
+        # while the plan is not counting sweeps yet.
+        maybe_iteration_info = ' %s / %s' % (
           self.action_iterations_complete[node],
           self.IterationRepetitionsSymbol(self.action_iteration[node])
         )
@@ -293,17 +391,29 @@ class Concertina(object):
     extra_lines = self.ProgressBar().split('\n')
     return AsArtGraph().GetPicture(updating=updating,
                                    extra_lines=extra_lines)
+  def ShowRunning(self, updating):
+     nodes, edges = self.AsNodesAndEdges()
+     running = [n for n in nodes if n.startswith('\033[1m')]
+     if not running:
+       return '*'
+     return '[%d / %d] ' % (len(self.complete_actions),
+                            len(self.all_actions)) + running[0]
 
   def AsNodesAndEdges(self):
     """Nodes and edges to display in terminal."""
     def ColoredNode(node):
       if node in self.action_iteration:
-        maybe_iteration_info = ' %d / %s' % (
+        # The completion may be a stage word ('probe', 'compiling')
+        # while the plan is not counting sweeps yet.
+        maybe_iteration_info = ' %s / %s' % (
           self.action_iterations_complete[node],
           self.IterationRepetitionsSymbol(self.action_iteration[node])
         )
         if node in self.action_stopped:
           maybe_iteration_info += ' / stop.'
+        # Redraws overwrite in place: pad so that a short counter
+        # blots out the tail of a longer stage word ('compiling').
+        maybe_iteration_info = maybe_iteration_info.ljust(18)
       else:
         maybe_iteration_info = ' ' * 10
       if node in self.running_actions:
@@ -311,7 +421,7 @@ class Concertina(object):
           return '\033[1m\033[93m' + node + maybe_iteration_info + '\033[0m'
         elif self.display_mode == 'colab-text':
           return (
-            '<b>' + node + ' <= running</b>'
+            '<b>' + node + maybe_iteration_info + ' <= running</b>'
           )
         else:
           assert False, self.display_mode
@@ -354,7 +464,9 @@ class Concertina(object):
         if a in self.complete_actions:
           complete_work += num_repetitions
         else:
-          complete_work += self.action_iterations_complete[a]
+          done = self.action_iterations_complete[a]
+          # A stage word ('probe', 'compiling') counts as no sweeps.
+          complete_work += done if isinstance(done, int) else 0
       else:
         total_work += 1
         complete_work += (a in self.complete_actions)
@@ -405,14 +517,18 @@ class Concertina(object):
     self.display_update_period = min(0.5, self.display_update_period * 1.2)
     if (now - self.recent_display_update_seconds <
         self.display_update_period and
-        not final):
+        not final and
+        not self.show_only_running):
       # Avoid frequent display updates slowing down execution.
       return
     self.recent_display_update_seconds = now
     if self.display_mode == 'colab':
       update_display(self.AsGraphViz(), display_id=self.display_id)
     elif self.display_mode == 'terminal':
-      print(self.AsTextPicture(updating=True))
+      if self.show_only_running:
+        print(self.ShowRunning(updating=True))
+      else:
+        print(self.AsTextPicture(updating=True))
     elif self.display_mode == 'colab-text':
       update_display(
         self.StateAsSimpleHTML(),

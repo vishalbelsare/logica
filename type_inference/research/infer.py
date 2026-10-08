@@ -207,6 +207,13 @@ class TypesInferenceEngine:
       t.PerformInference()
       self.UpdateTypes(rule)
 
+    # Resolve TypeRepr now that all predicates are typed.
+    for rule in self.parsed_rules:
+      if rule['head']['predicate_name'][0] == '@':
+        continue
+      t = TypeInferenceForRule(rule, self.predicate_signature)
+      Walk(rule, t.ActMindingTypeRepr)
+
     for rule in self.parsed_rules:
       Walk(rule, ConcretizeTypes)
     self.CollectTypes()
@@ -461,6 +468,36 @@ class TypeInferenceForRule:
         node['implication']['otherwise']['type']['the_type']
       )
 
+  def ActMindingTypeRepr(self, node):
+    for e in ExpressionsIterator(node):
+      if 'call' in e and e['call']['predicate_name'] == 'TypeRepr':
+        fvs = e['call']['record']['field_value']
+        pred = fvs[0]['value']['expression']['literal']['the_string']['the_string']
+        field = fvs[1]['value']['expression']['literal']['the_string']['the_string']
+        if isinstance(field, str):
+          try:
+            field = int(field)
+          except ValueError:
+            if field.startswith('col'):
+              try:
+                field = int(field[3:])
+              except ValueError:
+                pass  # Maybe this is "colhoz"?
+        if pred not in self.types_of_builtins:
+          raise TypeErrorCaughtException(
+            color.Format(
+              'TypeRepr references unknown predicate {warning}%s{end}.' % pred))
+        sig = self.types_of_builtins[pred]
+        if field not in sig:
+          raise TypeErrorCaughtException(
+            color.Format(
+              'TypeRepr references unknown field {warning}%s{end} '
+              'of predicate {warning}%s{end}.' % (field, pred)))
+        copier = reference_algebra.TypeStructureCopier()
+        reference_algebra.Unify(
+          e['type']['the_type'],
+          copier.CopyConcreteOrReferenceType(sig[field]))
+
   def IterateInference(self):
     Walk(self.rule, self.ActMindingTypingPredicateLiterals)
     Walk(self.rule, self.ActMindingRecordLiterals)
@@ -674,6 +711,35 @@ class TypeCollector:
     self.psql_type_cache = {}
     self.dialect = dialect
 
+  def ClickHouseType(self, t):
+    def _ClickHouseFieldName(key):
+      if isinstance(key, int):
+        return 'col%d' % key
+      return str(key)
+
+    # Note: this is an informational rendering for ClickHouse, stored in
+    # node['type']['type_name'].
+    if t == 'Str':
+      return 'String'
+    if t == 'Num':
+      return 'Float64'
+    if t == 'Bool':
+      return 'Bool'
+    if t == 'Time':
+      return 'DateTime'
+    if isinstance(t, list):
+      [e] = t
+      return 'Array(%s)' % self.ClickHouseType(e)
+    if isinstance(t, dict):
+      parts = []
+      for k, v in sorted(t.items(), key=reference_algebra.StrIntKey):
+        n = _ClickHouseFieldName(k)
+        rendered_v = self.ClickHouseType(v)
+        assert rendered_v is not None, v
+        parts.append('%s %s' % (n, rendered_v))
+      return 'Tuple(%s)' % ', '.join(parts)
+    assert False, t
+
   def ActPopulatingTypeMap(self, node):
     if 'type' in node:
       t = node['type']['the_type']
@@ -685,10 +751,16 @@ class TypeCollector:
       if reference_algebra.IsFullyDefined(t):
         self.psql_type_cache[t_rendering] = self.PsqlType(t)
       if isinstance(t, dict) and reference_algebra.IsFullyDefined(t):
-        node['type']['type_name'] = RecordTypeName(t_rendering)
+        if self.dialect == 'clickhouse':
+          node['type']['type_name'] = self.ClickHouseType(t)
+        else:
+          node['type']['type_name'] = RecordTypeName(t_rendering)
       if isinstance(t, list) and reference_algebra.IsFullyDefined(t):
         [e] = t
-        node['type']['element_type_name'] = self.PsqlType(e)
+        if self.dialect == 'clickhouse':
+          node['type']['element_type_name'] = self.ClickHouseType(e)
+        else:
+          node['type']['element_type_name'] = self.PsqlType(e)
 
   def CollectTypes(self):
     Walk(self.parsed_rules, self.ActPopulatingTypeMap)
@@ -704,6 +776,8 @@ class TypeCollector:
     if t == 'Str':
       return 'text'
     if t == 'Num':
+      if self.dialect == 'duckdb':
+        return 'double' # DuckDB doesn't understand numeric as int anyway.
       return 'numeric'
     if t == 'Bool':
       return 'bool'
@@ -717,6 +791,14 @@ class TypeCollector:
     assert False, t
 
   def BuildPsqlDefinitions(self):
+    # ClickHouse doesn't need (and doesn't support) PostgreSQL-style CREATE TYPE
+    # preambles. We still run type inference to attach fully-defined record
+    # types to expressions (e.g. for named tuples).
+    if self.dialect == 'clickhouse':
+      self.definitions = {}
+      self.typing_preamble = ''
+      return
+
     for t in self.psql_struct_type_name:
       arg_name = lambda x: (
         '"cast"' if x == 'cast'  # Escaping keyword.
@@ -746,7 +828,7 @@ class TypeCollector:
       )
     else:
       assert False, 'Unknown psql dialect: ' + self.dialect
-    
+
     self.definitions = {
       t: wrap(self.psql_struct_type_name[t], self.psql_type_definition[t])
       for t in sorted(self.psql_struct_type_name, key=len)
@@ -754,10 +836,16 @@ class TypeCollector:
     self.typing_preamble = BuildPreamble(self.definitions, self.dialect)
 
 def BuildPreamble(definitions, dialect):
+  if dialect == 'clickhouse':
+    return ''
+  # Gentle touch of genious here. Sorting definitions by length of the
+  # full type description automatically means that simpler types are defined
+  # before the ones that depend on them.
+  ordered_definitions = [definitions[k] for k in sorted(definitions, key=len)]
   if dialect in ['psql', 'sqlite', 'bigquery']:
-    return 'DO $$\nBEGIN\n' + '\n'.join(definitions.values()) + '\nEND $$;\n'
+    return 'DO $$\nBEGIN\n' + '\n'.join(ordered_definitions) + '\nEND $$;\n'
   elif dialect == 'duckdb':
-    return '\n'.join(definitions.values())
+    return '\n'.join(ordered_definitions)
   else:
     assert False, 'Unknown psql dialect: ' + dialect
 

@@ -25,10 +25,10 @@ Arrow(left, right) = arrow :-
 PrintToConsole(message) :- 1 == SqlExpr("PrintToConsole({message})", {message:});
 
 ArgMin(arr) = SqlExpr(
-    "argmin({a}, {v})", {a:, v:}) :- Arrow(a, v) == arr;
+    "argmin({a}, {v})", {a: arr.arg, v: arr.value});
 
 ArgMax(arr) = SqlExpr(
-    "argmax({a}, {v})", {a:, v:}) :- Arrow(a, v) == arr;
+    "argmax({a}, {v})", {a: arr.arg, v: arr.value});
 
 ArgMaxK(a, l) = SqlExpr(
   "(array_agg({arg_1} order by {value_1} desc))[1:{lim}]",
@@ -47,7 +47,7 @@ RecordAsJson(r) = SqlExpr(
 
 Fingerprint(s) = NaturalHash(s);
 
-ReadFile(filename) = SqlExpr("pg_read_file({filename})", {filename:});
+ReadFile(filename) = SqlExpr("(select struct_pack(size := any_value(size), content := any_value(content), filename := any_value(filename)) from read_text({filename}))", {filename:});
 
 Chr(x) = SqlExpr("Chr(cast({x} as integer))", {x:});
 Ord(x) = SqlExpr("Ord({x})", {x:});
@@ -63,6 +63,16 @@ TimeDiffSeconds(a, b) = Epoch(SqlExpr("{a} - {b}", {a:, b:}));
 ToTime(a) = SqlExpr("cast({a} as timestamp)", {a:});
 
 NaturalHash(x) = ToInt64(SqlExpr("hash(cast({x} as string)) // cast(2 as ubigint)", {x:}));
+
+# Deterministic hash-based pseudo-random value, uniform in (0, 1).
+UniformHash(x) = (NaturalHash(x) + 0.5) / 9223372036854775808.0;
+
+# Deterministic hash-based pseudo-random value, standard normal:
+# Box-Muller transform of two independently salted uniform hashes.
+NormalHash(x) =
+    Sqrt(-2.0 * Log(UniformHash(ToString(x) ++ "|normal-radius"))) *
+    Cos(2.0 * 3.141592653589793 *
+        UniformHash(ToString(x) ++ "|normal-angle"));
 
 # This is unsafe to use because due to the way Logica compiles this number
 # will be unique for each use of the variable, which can be a pain to debug.
@@ -87,7 +97,12 @@ ProverChoice(slot, options:) = options[i] :-
 # Clingo support.
 #
 
-Clingo(p, m) = SqlExpr("Clingo({p}, {m})", {p:, m:}) :-
+Clingo(p, m) = result :-
+  m ~ [{predicate: Str, args: [Str]}],
+  result = SqlExpr("Clingo({p}, {m})", {p:, m:}),
+  result ~ [{model_id: Num, model: [{predicate: Str, args: [Str]}]}];
+
+CompileClingo(p, m) = SqlExpr("CompileClingo({p}, {m})", {p:, m:}) :-
   m ~ [{predicate: Str, args: [Str]}];
 
 RunClingo(p) = SqlExpr("RunClingo({p})", {p:});

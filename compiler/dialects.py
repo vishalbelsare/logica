@@ -26,6 +26,7 @@ if '.' not in __package__:
   from compiler.dialect_libraries import presto_library
   from compiler.dialect_libraries import databricks_library
   from compiler.dialect_libraries import duckdb_library
+  from compiler.dialect_libraries import clickhouse_library
 else:
   from ..compiler.dialect_libraries import bq_library
   from ..compiler.dialect_libraries import psql_library
@@ -34,6 +35,8 @@ else:
   from ..compiler.dialect_libraries import presto_library
   from ..compiler.dialect_libraries import databricks_library
   from ..compiler.dialect_libraries import duckdb_library
+  from ..compiler.dialect_libraries import clickhouse_library
+
 def Get(engine):
   return DIALECTS[engine]()
 
@@ -164,7 +167,8 @@ class PostgreSQL(Dialect):
         'MagicalEntangle': '(CASE WHEN {1} = 0 THEN {0} ELSE NULL END)',
         'ArrayConcat': '{0} || {1}',
         'Split': 'STRING_TO_ARRAY({0}, {1})',
-        'AnyValue': '(ARRAY_AGG(%s))[1]'
+        'AnyValue': '(ARRAY_AGG(%s))[1]',
+        'Log': 'LN(%s)',  # Log is natural logarithm!
       }
 
   def InfixOperators(self):
@@ -236,6 +240,66 @@ class Trino(Dialect):
 
   def DecorateCombineRule(self, rule, var):
     return rule
+
+
+class ClickHouseDialect(Dialect):
+  """ClickHouse SQL dialect (minimal).
+
+  This is intentionally small: enough to compile and run basic programs.
+  """
+
+  def Name(self):
+    return 'ClickHouse'
+
+  def BuiltInFunctions(self):
+    return {
+        'Range': 'range(%s)',
+        'ToString': 'toString(%s)',
+        'ToInt64': 'toInt64(%s)',
+        'ToFloat64': 'toFloat64(%s)',
+        'Element': 'arrayElement({0}, {1} + 1)',
+        'Size': 'length(%s)',
+        'List': 'groupArray(%s)',
+        'Set': 'groupUniqArray(%s)',
+        'Count': 'countDistinct(%s)',
+        'AnyValue': 'any(%s)',
+        'ArrayConcat': 'arrayConcat({0}, {1})',
+        # Used internally to disambiguate aggregation scope inside (combine ...).
+        # Mirrors PostgreSQL/DuckDB behavior.
+        'MagicalEntangle': '(if({1} = 0, {0}, NULL))',
+        # The compiler implements "x in some_array" as an UNNEST with a
+        # generated table alias; this extracts the element from that alias.
+        'ValueOfUnnested': '{0}.unnested_pod',
+    }
+
+  def InfixOperators(self):
+    return {
+        '++': 'concat(%s, %s)',
+        'in': 'has({right}, {left})',
+    }
+
+  def Subscript(self, record, subscript, record_is_table):
+    if record_is_table:
+      return '%s.%s' % (record, subscript)
+    key = str(subscript).replace('\\', '\\\\').replace("'", "\\'")
+    return "tupleElement(%s, '%s')" % (record, key)
+
+  def LibraryProgram(self):
+    return clickhouse_library.library
+
+  def UnnestPhrase(self):
+    # ClickHouse doesn't support arrayJoin(...) as a table function in FROM.
+    # Use a subquery that produces a single column.
+    return '(select arrayJoin({0}) as unnested_pod) as {1}'
+
+  def ArrayPhrase(self):
+    return '[%s]'
+
+  def GroupBySpecBy(self):
+    return 'expr'
+
+  def DecorateCombineRule(self, rule, var):
+    return DecorateCombineRule(rule, var)
 
 
 class Presto(Dialect):
@@ -421,7 +485,10 @@ class DuckDB(Dialect):
           'DateDiffDay': "CAST(JULIANDAY({0}) - JULIANDAY({1}) AS INT64)",
           'CurrentTimestamp': 'GET_CURRENT_TIMESTAMP()',
           'TimeAdd': '{0} + to_microseconds(cast(1000000 * {1} as int64))',
-          'Rand': 'RANDOM(%s)'
+          'Rand': 'RANDOM(%s)',
+          'Log': 'LN(%s)',  # Log is natural logarithm!
+          'Set': 'ARRAY_AGG(DISTINCT {0} ORDER BY {0})',
+          'Agg++': 'LIST_REDUCE(LIST(%s), (a, b) -> a || b)'
       }
 
     def DecorateCombineRule(self, rule, var):
@@ -461,5 +528,6 @@ DIALECTS = {
     'trino': Trino,
     'databricks': Databricks,
     'duckdb': DuckDB,
+    'clickhouse': ClickHouseDialect,
 }
 
